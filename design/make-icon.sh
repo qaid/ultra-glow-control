@@ -35,8 +35,8 @@ for pair in "${SIZES[@]}"; do
   render "${pair##*:}" "$ICONSET/${pair%%:*}.png"
 done
 
-rm -f "$OUT"
-iconutil -c icns "$ICONSET" -o "$OUT"
+iconutil -c icns "$ICONSET" -o "$OUT.tmp"
+mv -f "$OUT.tmp" "$OUT"
 rm -rf "$ICONSET"
 
 echo "Built: $(pwd)/$OUT"

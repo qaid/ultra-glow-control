@@ -124,16 +124,23 @@ final class LitraHID {
     private func advertisesVendorUsage(_ dev: IOHIDDevice) -> Bool {
         if let primary = IOHIDDeviceGetProperty(dev, kIOHIDPrimaryUsagePageKey as CFString) as? Int,
            primary == Litra.usagePage { return true }
-        if let pairs = IOHIDDeviceGetProperty(dev, kIOHIDDeviceUsagePairsKey as CFString) as? [[String: Int]] {
-            return pairs.contains { $0[kIOHIDDeviceUsagePageKey as String] == Litra.usagePage }
+        if let pairs = IOHIDDeviceGetProperty(dev, kIOHIDDeviceUsagePairsKey as CFString) as? [[String: Any]] {
+            return pairs.contains { ($0[kIOHIDDeviceUsagePageKey as String] as? Int) == Litra.usagePage }
         }
         return false
     }
 
-    private func open(_ dev: IOHIDDevice) {
+    private func open(_ dev: IOHIDDevice, attempt: Int = 0) {
         guard device == nil else { return }
         guard IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
-            log("open failed (is Logi Options+/G HUB or the Logitech app holding the light?)")
+            if attempt < 3 {
+                log("open failed; retrying (attempt \(attempt + 1))")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    self?.open(dev, attempt: attempt + 1)
+                }
+            } else {
+                log("open failed after retries (is Logi Options+/G HUB or the Logitech app holding the light?)")
+            }
             return
         }
         device = dev
@@ -211,14 +218,17 @@ final class LightModel: ObservableObject {
     private func applyAll() {
         // ponytail: stagger the three connect-time writes ~30ms apart — three back-to-back
         // SetReports are the same HID++ flood the sliders throttle, and the light can drop the
-        // 2nd/3rd on a cold reconnect.
+        // 2nd/3rd on a cold reconnect. A generation guard drops stale sends if applyAll() is
+        // called again (rapid disconnect+reconnect) before the deferred writes fire.
+        applyGeneration += 1
+        let gen = applyGeneration
         hid.send(Litra.power(isOn))
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
-            guard let self else { return }
+            guard let self, self.applyGeneration == gen else { return }
             self.hid.send(Litra.brightness(lumen: Litra.lumen(forPercent: self.brightness)))
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-            guard let self else { return }
+            guard let self, self.applyGeneration == gen else { return }
             self.hid.send(Litra.temperature(kelvin: Int(self.temperature)))
         }
     }
@@ -263,6 +273,7 @@ final class LightModel: ObservableObject {
     }
 
     // MARK: throttle
+    private var applyGeneration = 0
     private let brightnessThrottle = Throttle()
     private let temperatureThrottle = Throttle()
 }
