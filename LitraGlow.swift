@@ -559,6 +559,48 @@ struct PanelView: View {
     }
 }
 
+// MARK: - Menu bar icon
+
+// A monochrome glyph echoing the app icon's radiant glow (rays + core) rather than a stock
+// lightbulb. Drawn as a template image so AppKit recolors it to match a light or dark menu bar.
+// ponytail: the full-color squircle app icon can't be a menu-bar glyph (those must be small,
+// single-color templates), so this is the reduced line-art version of the same motif. Fewer rays
+// than the app icon (8 vs 12) so it stays crisp at ~18pt. Filled core when the light is on; hollow
+// ring when it's off or disconnected.
+enum MenuBarIcon {
+    static func image(on: Bool) -> NSImage {
+        let size = NSSize(width: 18, height: 18)
+        let img = NSImage(size: size, flipped: false) { _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            let c = CGPoint(x: 9, y: 9)
+            ctx.setStrokeColor(NSColor.black.cgColor)
+            ctx.setFillColor(NSColor.black.cgColor)
+            ctx.setLineCap(.round)
+
+            let rayInner: CGFloat = 5.4, rayOuter: CGFloat = 8.3
+            ctx.setLineWidth(1.35)
+            for i in 0..<8 {
+                let a = CGFloat(i) * .pi / 4
+                ctx.move(to: CGPoint(x: c.x + cos(a) * rayInner, y: c.y + sin(a) * rayInner))
+                ctx.addLine(to: CGPoint(x: c.x + cos(a) * rayOuter, y: c.y + sin(a) * rayOuter))
+            }
+            ctx.strokePath()
+
+            let r: CGFloat = 3.0
+            let rect = CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)
+            if on {
+                ctx.fillEllipse(in: rect)
+            } else {
+                ctx.setLineWidth(1.5)
+                ctx.strokeEllipse(in: rect)
+            }
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+}
+
 // MARK: - App
 
 @main
@@ -574,7 +616,7 @@ struct LitraGlowApp: App {
         MenuBarExtra {
             PanelView(model: model)
         } label: {
-            Image(systemName: model.connected && model.isOn ? "lightbulb.fill" : "lightbulb")
+            Image(nsImage: MenuBarIcon.image(on: model.connected && model.isOn))
         }
         .menuBarExtraStyle(.window)
     }
