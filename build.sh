@@ -6,7 +6,9 @@ cd "$(dirname "$0")"
 
 APP="Litra Glow.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+cp design/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 swiftc LitraGlow.swift \
   -parse-as-library \
@@ -23,6 +25,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleIdentifier</key><string>design.constellation.litra-glow</string>
     <key>CFBundleName</key><string>Litra Glow</string>
     <key>CFBundleExecutable</key><string>Litra Glow</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
