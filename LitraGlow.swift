@@ -75,12 +75,14 @@ final class LitraHID {
     init() {
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
-        // Match only the vendor interface (usagePage 0xff43); the Glow exposes several HID
-        // interfaces and only this one accepts the light commands.
+        // Match on VID+PID only, then pick the 0xff43 interface in `matched()`. We deliberately do
+        // NOT filter on kIOHIDPrimaryUsagePageKey here: that only matches when 0xff43 is the device's
+        // *primary* (first) collection, and if the Litra exposes it as a secondary collection the
+        // callback would never fire and the app would silently sit on "not connected". node-hid (the
+        // reference litra driver) finds 0xff43 across *all* usage pairs, so we mirror that.
         let match: [String: Any] = [
             kIOHIDVendorIDKey: Litra.vendorID,
             kIOHIDProductIDKey: Litra.productID,
-            kIOHIDPrimaryUsagePageKey: Litra.usagePage,
         ]
         IOHIDManagerSetDeviceMatching(manager, match as CFDictionary)
 
@@ -98,18 +100,50 @@ final class LitraHID {
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
     }
 
+    private var fallback: IOHIDDevice?
+
     private func matched(_ dev: IOHIDDevice) {
-        guard device == nil else { return } // first matching interface wins
+        guard device == nil else { return }
+        if advertisesVendorUsage(dev) {
+            open(dev)
+        } else if fallback == nil {
+            // Not the 0xff43 interface. Remember it; if no 0xff43 interface shows up shortly (a
+            // topology where the vendor collection isn't enumerated as its own device), open this
+            // one anyway — SetReport routes by report id 0x11 regardless of which we opened.
+            fallback = dev
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self, self.device == nil, let fb = self.fallback else { return }
+                self.log("no 0xff43 interface seen; opening sole matching device")
+                self.open(fb)
+            }
+        }
+    }
+
+    // Mirrors node-hid: look for usage page 0xff43 anywhere in the device's usage pairs, plus the
+    // primary usage page as a fallback.
+    private func advertisesVendorUsage(_ dev: IOHIDDevice) -> Bool {
+        if let primary = IOHIDDeviceGetProperty(dev, kIOHIDPrimaryUsagePageKey as CFString) as? Int,
+           primary == Litra.usagePage { return true }
+        if let pairs = IOHIDDeviceGetProperty(dev, kIOHIDDeviceUsagePairsKey as CFString) as? [[String: Int]] {
+            return pairs.contains { $0[kIOHIDDeviceUsagePageKey as String] == Litra.usagePage }
+        }
+        return false
+    }
+
+    private func open(_ dev: IOHIDDevice) {
+        guard device == nil else { return }
         guard IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
             log("open failed (is Logi Options+/G HUB or the Logitech app holding the light?)")
             return
         }
         device = dev
+        fallback = nil
         log("connected to Litra Glow")
         onConnect?()
     }
 
     private func removed(_ dev: IOHIDDevice) {
+        if dev == fallback { fallback = nil }
         guard dev == device else { return }
         device = nil
         log("disconnected")
@@ -175,9 +209,18 @@ final class LightModel: ObservableObject {
     // MARK: writes
 
     private func applyAll() {
+        // ponytail: stagger the three connect-time writes ~30ms apart — three back-to-back
+        // SetReports are the same HID++ flood the sliders throttle, and the light can drop the
+        // 2nd/3rd on a cold reconnect.
         hid.send(Litra.power(isOn))
-        hid.send(Litra.brightness(lumen: Litra.lumen(forPercent: brightness)))
-        hid.send(Litra.temperature(kelvin: Int(temperature)))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            guard let self else { return }
+            self.hid.send(Litra.brightness(lumen: Litra.lumen(forPercent: self.brightness)))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self else { return }
+            self.hid.send(Litra.temperature(kelvin: Int(self.temperature)))
+        }
     }
 
     func setPower(_ on: Bool) {
@@ -189,7 +232,7 @@ final class LightModel: ObservableObject {
     func setBrightness(_ p: Double) {
         brightness = p
         defaults.set(p, forKey: "brightness")
-        throttle(&brightnessGate) { [weak self] in
+        brightnessThrottle.fire { [weak self] in
             self?.hid.send(Litra.brightness(lumen: Litra.lumen(forPercent: p)))
         }
     }
@@ -198,7 +241,7 @@ final class LightModel: ObservableObject {
         let snapped = (k / 100).rounded() * 100
         temperature = snapped
         defaults.set(snapped, forKey: "temperature")
-        throttle(&temperatureGate) { [weak self] in
+        temperatureThrottle.fire { [weak self] in
             self?.hid.send(Litra.temperature(kelvin: Int(snapped)))
         }
     }
@@ -220,26 +263,42 @@ final class LightModel: ObservableObject {
     }
 
     // MARK: throttle
-    // ponytail: HID++ drops reports flooded during a slider drag, so coalesce to ~1 write / 60ms
-    // with a guaranteed trailing send so the value the finger stops on always lands on the device.
-    private struct Gate { var last = Date.distantPast; var pending: DispatchWorkItem? }
-    private var brightnessGate = Gate()
-    private var temperatureGate = Gate()
-    private let interval: TimeInterval = 0.06
+    private let brightnessThrottle = Throttle()
+    private let temperatureThrottle = Throttle()
+}
 
-    private func throttle(_ gate: inout Gate, _ send: @escaping () -> Void) {
-        gate.pending?.cancel()
+// ponytail: HID++ drops reports flooded during a slider drag, so coalesce to ~1 write / 60ms.
+// Leading edge fires immediately; a trailing send is scheduled for anything that arrives inside the
+// window so the value the finger stops on always lands. `last` only ever advances to a real send
+// time (never to a projected future time), so a continuous drag can't push the trailing send later
+// and later — the earlier inout-struct version had exactly that lag bug. Main-thread only.
+final class Throttle {
+    private let interval: TimeInterval = 0.06
+    private var last = Date.distantPast
+    private var pending: DispatchWorkItem?
+    private var latest: (() -> Void)?
+
+    func fire(_ send: @escaping () -> Void) {
+        latest = send
         let now = Date()
-        if now.timeIntervalSince(gate.last) >= interval {
-            gate.last = now
+        let elapsed = now.timeIntervalSince(last)
+        if elapsed >= interval {
+            last = now
+            latest = nil
             send()
-        } else {
-            let work = DispatchWorkItem { send() }
-            gate.pending = work
-            let delay = interval - now.timeIntervalSince(gate.last)
-            gate.last = now.addingTimeInterval(delay)
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        } else if pending == nil {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.pending = nil
+                self.last = Date()
+                let s = self.latest
+                self.latest = nil
+                s?()
+            }
+            pending = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + (interval - elapsed), execute: work)
         }
+        // else: a trailing send is already scheduled; `latest` now holds the newest value it'll use.
     }
 }
 

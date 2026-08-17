@@ -25,7 +25,7 @@ build.sh          swiftc build -> "Litra Glow.app"  (--install copies to ~/Appli
 
 ## Protocol notes (the part that's easy to get wrong)
 
-- Match VID `0x046d` + PID `0xc900` **and usagePage `0xff43`**: the Glow exposes several HID interfaces and only that one accepts light commands.
+- Match VID `0x046d` + PID `0xc900`, then open the interface advertising usagePage `0xff43` (checked across the device's usage *pairs*, like node-hid — not just the primary usage page, since 0xff43 may be a secondary collection). Only that interface accepts light commands. There's a fallback to the sole matching device if no 0xff43 interface enumerates.
 - Commands are 20-byte output reports, report id `0x11`, feature index `0x04` (Beam LX would be `0x06`), right-padded with `0x00`:
   - power: `11 ff 04 1c 01`/`00`; brightness: `11 ff 04 4c <hi> <lo>` (Lumen 20-250); temperature: `11 ff 04 9c <hi> <lo>` (Kelvin, multiples of 100, 2700-6500).
 - **SetReport framing:** send the full 20-byte buffer (leading `0x11` kept) with `reportID = 0x11` — this mirrors hidapi's verified macOS `set_report` (it strips the leading byte only when it's `0x00`). Fallback if a device no-ops: `reportID 0x11` with `bytes[1...]`.
