@@ -6,3 +6,4 @@
 
 # transient iconset (design/AppIcon.icns is committed; the .iconset is not)
 design/AppIcon.iconset/
+.superset/
