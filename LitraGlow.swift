@@ -469,7 +469,11 @@ struct PanelView: View {
         ("Video call", 80, 4500),
     ]
 
-    private var focusOrder: [PanelFocus] { PanelFocus.order(presetCount: presets.count) }
+    // No light connected: the panel is just an explanation and a Quit button, so that's the
+    // entire focus order (Tab stays put on it; Escape/Return still work as usual).
+    private var focusOrder: [PanelFocus] {
+        model.connected ? PanelFocus.order(presetCount: presets.count) : [.quit]
+    }
 
     private func advanceFocus(backward: Bool) {
         let order = focusOrder
@@ -482,13 +486,15 @@ struct PanelView: View {
         focus = order[(next + order.count) % order.count]
     }
 
-    // Only takes focus if nothing already has it (don't yank focus away mid-interaction), and only
-    // if a control actually exists to focus (connected). A short defer covers the window not being
-    // key yet at the moment this fires.
-    private func focusPowerWhenReady() {
-        guard model.connected, focus == nil else { return }
+    // Only takes focus if nothing already has it (don't yank focus away mid-interaction).
+    // @FocusState writes are dropped if the window isn't key yet at the moment they run, so this
+    // retries a bounded number of times, ~0.1s apart, stopping as soon as a write sticks.
+    private func seedFocus(attempt: Int = 0) {
+        guard focus == nil, attempt < 5 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            if focus == nil { focus = .power }
+            guard self.focus == nil else { return }
+            self.focus = self.model.connected ? .power : .quit
+            self.seedFocus(attempt: attempt + 1)
         }
     }
 
@@ -514,23 +520,24 @@ struct PanelView: View {
         .background(LinearGradient(colors: [Aperture.bgTop, Aperture.bgBottom], startPoint: .top, endPoint: .bottom))
         .onAppear {
             model.refreshLaunchAtLogin()
-            focusPowerWhenReady()
+            seedFocus()
         }
-        // The HID connect callback lands asynchronously and can be either before or after this
-        // view's onAppear, so also grab initial focus the moment `connected` flips true (e.g. the
-        // light was plugged in after the panel opened).
-        .onChange(of: model.connected) { _, connected in
-            if connected { focusPowerWhenReady() }
+        // The HID connect callback lands asynchronously and can land either before or after this
+        // view's onAppear, so also re-seed focus whenever `connected` changes (e.g. the light was
+        // plugged in after the panel opened, or unplugged while it was open — either transition
+        // resets @FocusState to nil since the control it pointed at disappears).
+        .onChange(of: model.connected) { _, _ in
+            seedFocus()
         }
         .onKeyPress(keys: [.tab]) { press in
-            guard model.connected else { return .ignored }
             advanceFocus(backward: press.modifiers.contains(.shift))
             return .handled
         }
         .onKeyPress(keys: [.escape]) { _ in
             // MenuBarExtra's window has no close button, so performClose no-ops (or beeps); close()
-            // dismisses it directly. Defensive: VERIFIED FACTS say Escape may never even reach the
-            // app's key event monitor, in which case macOS is already handling dismissal itself.
+            // dismisses it directly. Defensive backstop: a local NSEvent keyDown monitor logged
+            // arrow keys, space, and letters from this panel but never keyCode 53 (Escape), so
+            // macOS appears to consume Escape and dismiss the panel itself before it reaches here.
             NSApp.keyWindow?.close()
             return .handled
         }
@@ -706,6 +713,13 @@ struct PanelView: View {
             }
             .buttonStyle(.plain)
             .padding(.top, 4)
+            .focusable()
+            .focused($focus, equals: .quit)
+            .focusRing(focus == .quit, cornerRadius: 8)
+            .onKeyPress(keys: [.space, .return]) { _ in
+                NSApp.terminate(nil)
+                return .handled
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 34)
@@ -759,8 +773,15 @@ enum MenuBarIcon {
 /// An agent app has no window to raise, so we open the menu-bar panel instead: on first
 /// launch, and on reopen (a second `open -a` while we already run).
 /// ponytail: MenuBarExtra owns its NSStatusItem privately, so we fish the button out by KVC
-/// and click it. All optional; a macOS change degrades to "panel does not auto-open".
+/// and click it. The `responds(to:)` check guards against a future macOS renaming or removing
+/// the private "statusItem" key: without it, `value(forKey:)` would call `valueForUndefinedKey:`
+/// and raise an uncatchable NSUnknownKeyException, crashing on every launch. With the guard, an
+/// absent key just returns nil and the panel does not auto-open.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    // Cancelled and replaced on every showPanel() call so a stale, still-pending launch/reopen
+    // request can't fire later and reopen a panel the user already closed in the meantime.
+    private var pendingShow: DispatchWorkItem?
+
     func applicationDidFinishLaunching(_ n: Notification) {
         showPanel()
     }
@@ -771,9 +792,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showPanel() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            guard !self.panelIsVisible() else { return }   // performClick toggles; do not close it
-            self.statusItem()?.button?.performClick(nil)
+        pendingShow?.cancel()
+        let work = DispatchWorkItem { [self] in
+            guard !panelIsVisible() else { return }   // performClick toggles; do not close it
+            statusItem()?.button?.performClick(nil)
             NSApp.activate(ignoringOtherApps: true)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 for w in NSApp.windows where w.isVisible && w.className.contains("MenuBarExtraWindow") {
@@ -781,11 +803,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        pendingShow = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
 
     private func statusItem() -> NSStatusItem? {
+        let key = "statusItem"
         for w in NSApp.windows where String(describing: type(of: w)).contains("StatusBarWindow") {
-            if let item = w.value(forKey: "statusItem") as? NSStatusItem { return item }
+            guard w.responds(to: NSSelectorFromString(key)) else { continue }
+            if let item = w.value(forKey: key) as? NSStatusItem { return item }
         }
         return nil
     }

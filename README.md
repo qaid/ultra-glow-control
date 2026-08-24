@@ -20,7 +20,7 @@ The panel shares its visual language ("Aperture" — warm charcoal with amber ac
 ./build.sh --install  # also copies it to ~/Applications
 ```
 
-Needs the Xcode command-line tools (`xcode-select --install`). No Xcode project, no dependencies. Builds for `arm64-apple-macos13.0`.
+Needs the Xcode command-line tools (`xcode-select --install`). No Xcode project, no dependencies. Builds for `arm64-apple-macos14.0`.
 
 Launch it from `~/Applications` (or double-click the built `.app`). It lives in the menu bar with no Dock icon; click the lightbulb icon to open the panel.
 
