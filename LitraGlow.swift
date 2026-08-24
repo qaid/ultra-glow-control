@@ -422,10 +422,45 @@ struct ApertureSlider: View {
     }
 }
 
+// MARK: - Keyboard focus traversal
+
+// Deterministic Tab / Shift-Tab order, driven entirely by this app rather than the macOS
+// "Keyboard navigation" system setting (which the panel cannot depend on). `presetCount` lets the
+// order adapt if the preset list ever changes length without touching this enum.
+enum PanelFocus: Hashable {
+    case power, brightness, temperature, preset(Int), launchAtLogin, quit
+
+    static func order(presetCount: Int) -> [PanelFocus] {
+        [.power, .brightness, .temperature] + (0..<presetCount).map { .preset($0) } + [.launchAtLogin, .quit]
+    }
+}
+
+// A tasteful, Aperture-colored focus ring, used instead of the default macOS blue ring
+// (.focusEffectDisabled() suppresses that everywhere this is applied).
+struct FocusRing: ViewModifier {
+    let isFocused: Bool
+    var cornerRadius: CGFloat = 6
+    func body(content: Content) -> some View {
+        content
+            .focusEffectDisabled()
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .stroke(Aperture.accent, lineWidth: isFocused ? 2 : 0)
+                    .padding(-3)
+            )
+    }
+}
+extension View {
+    func focusRing(_ isFocused: Bool, cornerRadius: CGFloat = 6) -> some View {
+        modifier(FocusRing(isFocused: isFocused, cornerRadius: cornerRadius))
+    }
+}
+
 // MARK: - Panel
 
 struct PanelView: View {
     @ObservedObject var model: LightModel
+    @FocusState private var focus: PanelFocus?
 
     // Presets: (title, brightness %, temperature K).
     private let presets: [(String, Double, Double)] = [
@@ -433,6 +468,39 @@ struct PanelView: View {
         ("Bright", 100, 6500),
         ("Video call", 80, 4500),
     ]
+
+    private var focusOrder: [PanelFocus] { PanelFocus.order(presetCount: presets.count) }
+
+    private func advanceFocus(backward: Bool) {
+        let order = focusOrder
+        guard !order.isEmpty else { return }
+        guard let current = focus, let idx = order.firstIndex(of: current) else {
+            focus = backward ? order.last : order.first
+            return
+        }
+        let next = backward ? idx - 1 : idx + 1
+        focus = order[(next + order.count) % order.count]
+    }
+
+    // Only takes focus if nothing already has it (don't yank focus away mid-interaction), and only
+    // if a control actually exists to focus (connected). A short defer covers the window not being
+    // key yet at the moment this fires.
+    private func focusPowerWhenReady() {
+        guard model.connected, focus == nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            if focus == nil { focus = .power }
+        }
+    }
+
+    // Shared arrow-key step for both sliders: mutates the bound value, clamps to range, and runs
+    // it through the same setter the drag gesture uses so the throttle/HID write path is identical.
+    private func step(_ value: inout Double, range: ClosedRange<Double>, by direction: Double,
+                       normalStep: Double, shiftStep: Double, shift: Bool, apply: (Double) -> Void) {
+        let delta = (shift ? shiftStep : normalStep) * direction
+        let next = min(max(value + delta, range.lowerBound), range.upperBound)
+        value = next
+        apply(next)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -444,7 +512,28 @@ struct PanelView: View {
         }
         .frame(width: 288)
         .background(LinearGradient(colors: [Aperture.bgTop, Aperture.bgBottom], startPoint: .top, endPoint: .bottom))
-        .onAppear { model.refreshLaunchAtLogin() }
+        .onAppear {
+            model.refreshLaunchAtLogin()
+            focusPowerWhenReady()
+        }
+        // The HID connect callback lands asynchronously and can be either before or after this
+        // view's onAppear, so also grab initial focus the moment `connected` flips true (e.g. the
+        // light was plugged in after the panel opened).
+        .onChange(of: model.connected) { _, connected in
+            if connected { focusPowerWhenReady() }
+        }
+        .onKeyPress(keys: [.tab]) { press in
+            guard model.connected else { return .ignored }
+            advanceFocus(backward: press.modifiers.contains(.shift))
+            return .handled
+        }
+        .onKeyPress(keys: [.escape]) { _ in
+            // MenuBarExtra's window has no close button, so performClose no-ops (or beeps); close()
+            // dismisses it directly. Defensive: VERIFIED FACTS say Escape may never even reach the
+            // app's key event monitor, in which case macOS is already handling dismissal itself.
+            NSApp.keyWindow?.close()
+            return .handled
+        }
     }
 
     private var header: some View {
@@ -467,6 +556,13 @@ struct PanelView: View {
                 .labelsHidden()
                 .toggleStyle(ApertureToggleStyle())
                 .frame(width: 34)
+                .focusable()
+                .focused($focus, equals: .power)
+                .focusRing(focus == .power, cornerRadius: 10)
+                .onKeyPress(keys: [.space, .return]) { _ in
+                    model.setPower(!model.isOn)
+                    return .handled
+                }
         }
         .padding(.horizontal, 18)
         .padding(.top, 14)
@@ -482,9 +578,29 @@ struct PanelView: View {
             VStack(spacing: 16) {
                 ApertureSlider(label: "BRIGHTNESS", value: $model.brightness, range: model.brightnessRange,
                                format: { "\(Int($0.rounded())) %" }, onChange: model.setBrightness)
+                    .focusable()
+                    .focused($focus, equals: .brightness)
+                    .focusRing(focus == .brightness)
+                    .onKeyPress(keys: [.leftArrow, .rightArrow]) { press in
+                        step(&model.brightness, range: model.brightnessRange,
+                             by: press.key == .leftArrow ? -1 : 1,
+                             normalStep: 5, shiftStep: 20, shift: press.modifiers.contains(.shift),
+                             apply: model.setBrightness)
+                        return .handled
+                    }
                 ApertureSlider(label: "TEMPERATURE", value: $model.temperature, range: model.temperatureRange,
                                format: { "\(Int(($0/100).rounded())*100) K" }, onChange: model.setTemperature,
                                trackColors: [Color(hex: 0xffb44d), Color(hex: 0xfff4e0), Color(hex: 0xbcd7ff)])
+                    .focusable()
+                    .focused($focus, equals: .temperature)
+                    .focusRing(focus == .temperature)
+                    .onKeyPress(keys: [.leftArrow, .rightArrow]) { press in
+                        step(&model.temperature, range: model.temperatureRange,
+                             by: press.key == .leftArrow ? -1 : 1,
+                             normalStep: 100, shiftStep: 500, shift: press.modifiers.contains(.shift),
+                             apply: model.setTemperature)
+                        return .handled
+                    }
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 16)
@@ -498,7 +614,7 @@ struct PanelView: View {
                     .foregroundColor(Aperture.label)
                     .kerning(0.4)
                 HStack(spacing: 8) {
-                    ForEach(presets, id: \.0) { preset in
+                    ForEach(Array(presets.enumerated()), id: \.offset) { index, preset in
                         Button(action: { model.applyPreset(brightness: preset.1, temperature: preset.2) }) {
                             Text(preset.0)
                                 .font(.system(size: 11.5, weight: .semibold, design: .rounded))
@@ -511,6 +627,18 @@ struct PanelView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
                         .buttonStyle(.plain)
+                        // Don't lean on a plain-style Button's default Space/Return activation: with
+                        // the macOS "Keyboard navigation" setting off (which this panel must not
+                        // depend on), it may not take programmatic focus at all — and if it can't,
+                        // FocusState resets to nil and Tab traversal silently skips this stop.
+                        // .focusable() + an explicit key handler makes activation deterministic.
+                        .focusable()
+                        .focused($focus, equals: .preset(index))
+                        .focusRing(focus == .preset(index), cornerRadius: 8)
+                        .onKeyPress(keys: [.space, .return]) { _ in
+                            model.applyPreset(brightness: preset.1, temperature: preset.2)
+                            return .handled
+                        }
                     }
                 }
             }
@@ -527,6 +655,13 @@ struct PanelView: View {
             .toggleStyle(ApertureToggleStyle())
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
+            .focusable()
+            .focused($focus, equals: .launchAtLogin)
+            .focusRing(focus == .launchAtLogin)
+            .onKeyPress(keys: [.space, .return]) { _ in
+                model.setLaunchAtLogin(!model.launchAtLogin)
+                return .handled
+            }
 
             Rectangle().fill(Aperture.hairline).frame(height: 1)
 
@@ -540,6 +675,13 @@ struct PanelView: View {
                         .padding(.vertical, 6)
                 }
                 .buttonStyle(.plain)
+                .focusable()
+                .focused($focus, equals: .quit)
+                .focusRing(focus == .quit, cornerRadius: 8)
+                .onKeyPress(keys: [.space, .return]) { _ in
+                    NSApp.terminate(nil)
+                    return .handled
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -614,9 +756,49 @@ enum MenuBarIcon {
 
 // MARK: - App
 
+/// An agent app has no window to raise, so we open the menu-bar panel instead: on first
+/// launch, and on reopen (a second `open -a` while we already run).
+/// ponytail: MenuBarExtra owns its NSStatusItem privately, so we fish the button out by KVC
+/// and click it. All optional; a macOS change degrades to "panel does not auto-open".
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ n: Notification) {
+        showPanel()
+    }
+
+    func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        showPanel()
+        return true
+    }
+
+    private func showPanel() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            guard !self.panelIsVisible() else { return }   // performClick toggles; do not close it
+            self.statusItem()?.button?.performClick(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                for w in NSApp.windows where w.isVisible && w.className.contains("MenuBarExtraWindow") {
+                    w.makeKeyAndOrderFront(nil)
+                }
+            }
+        }
+    }
+
+    private func statusItem() -> NSStatusItem? {
+        for w in NSApp.windows where String(describing: type(of: w)).contains("StatusBarWindow") {
+            if let item = w.value(forKey: "statusItem") as? NSStatusItem { return item }
+        }
+        return nil
+    }
+
+    private func panelIsVisible() -> Bool {
+        NSApp.windows.contains { $0.isVisible && $0.className.contains("MenuBarExtraWindow") }
+    }
+}
+
 @main
 struct LitraGlowApp: App {
     @StateObject private var model = LightModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     init() {
         // LSUIElement in Info.plist keeps us out of the Dock; this backs it up when run bare.
