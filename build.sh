@@ -13,7 +13,7 @@ cp design/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 swiftc LitraGlow.swift \
   -parse-as-library \
   -framework Cocoa -framework SwiftUI -framework IOKit -framework ServiceManagement \
-  -target arm64-apple-macos13.0 \
+  -target arm64-apple-macos14.0 \
   -O \
   -o "$APP/Contents/MacOS/Litra Glow"
 
@@ -28,7 +28,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>

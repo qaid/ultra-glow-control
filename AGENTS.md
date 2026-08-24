@@ -39,4 +39,4 @@ build.sh          swiftc build -> "Litra Glow.app"  (--install copies to ~/Appli
 
 ## Building
 
-- `./build.sh` (needs Xcode command-line tools; no Xcode project). `--install` also copies to `~/Applications`. Target `arm64-apple-macos13.0`, bundle id `design.constellation.litra-glow`, `LSUIElement` agent app.
+- `./build.sh` (needs Xcode command-line tools; no Xcode project). `--install` also copies to `~/Applications`. Target `arm64-apple-macos14.0`, bundle id `design.constellation.litra-glow`, `LSUIElement` agent app. The 14.0 floor exists because the panel's keyboard support uses `.onKeyPress` and `.focusEffectDisabled()`, both introduced in macOS 14.
