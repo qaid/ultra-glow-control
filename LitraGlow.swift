@@ -791,16 +791,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func showPanel() {
+    private func showPanel(attempt: Int = 0) {
         pendingShow?.cancel()
         let work = DispatchWorkItem { [self] in
             guard !panelIsVisible() else { return }   // performClick toggles; do not close it
-            statusItem()?.button?.performClick(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                for w in NSApp.windows where w.isVisible && w.className.contains("MenuBarExtraWindow") {
-                    w.makeKeyAndOrderFront(nil)
+            if let item = statusItem() {
+                item.button?.performClick(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    for w in NSApp.windows where w.isVisible && w.className.contains("MenuBarExtraWindow") {
+                        w.makeKeyAndOrderFront(nil)
+                    }
                 }
+            } else if attempt < 8 {
+                // Status bar window not yet in NSApp.windows (slow MenuBarExtra setup). Retry.
+                showPanel(attempt: attempt + 1)
             }
         }
         pendingShow = work
@@ -808,8 +813,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func statusItem() -> NSStatusItem? {
+        // The private class name was "NSStatusBarWindow" on macOS 14-15; it may be renamed on
+        // macOS 16+. Skip the class-name filter and rely solely on the KVC key + type cast so the
+        // search stays valid across macOS versions.
         let key = "statusItem"
-        for w in NSApp.windows where String(describing: type(of: w)).contains("StatusBarWindow") {
+        for w in NSApp.windows {
             guard w.responds(to: NSSelectorFromString(key)) else { continue }
             if let item = w.value(forKey: key) as? NSStatusItem { return item }
         }
